@@ -7,7 +7,6 @@ from pathlib import Path
 from time import sleep
 from typing import List, Any, Callable
 
-
 PATH_CONFIG_DEFAULT: str = "config.default.ini"
 PATH_CONFIG_USER: str = "config.ini"
 
@@ -204,6 +203,7 @@ TIME_BEFORE_RESTART: int = get_int_from_config("DEFAULT", "TIME_BEFORE_RESTART")
 # ----- Options -----
 CURRENT_FROM_VICTRON: bool = get_bool_from_config("DEFAULT", "CURRENT_FROM_VICTRON")
 USE_SMARTSHUNTS: bool = get_bool_from_config("DEFAULT", "USE_SMARTSHUNTS")
+USE_VEDIRECT_SMARTSHUNT_PORTS: List[str] = get_list_from_config("DEFAULT", "USE_VEDIRECT_SMARTSHUNT_PORTS", str)
 INVERT_SMARTSHUNTS: bool = get_bool_from_config("DEFAULT", "INVERT_SMARTSHUNTS")
 IGNORE_SMARTSHUNT_ABSENCE: bool = get_bool_from_config("DEFAULT", "IGNORE_SMARTSHUNT_ABSENCE")
 OWN_SOC: bool = get_bool_from_config("DEFAULT", "OWN_SOC")

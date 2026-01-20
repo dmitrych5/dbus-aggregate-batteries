@@ -32,6 +32,8 @@ from datetime import datetime as dt
 import time as tt
 from dbusmon import DbusMon
 from threading import Thread
+from typing import Optional
+from vedirect_shunt_monitor import VeDirectShuntMonitor
 
 # add ext folder to sys.path
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
@@ -372,6 +374,7 @@ class DbusAggBatService(object):
 
         # SmartShunt list - will be populated so battery category SmartShunts are at the beginning of the list
         self._smartShunt_list = []
+        self._vedirect_smartshunt_list: list[VeDirectShuntMonitor] = []
 
         # no SmartShunts in the battery category have been found yet
         self._num_battery_shunts = 0
@@ -410,6 +413,9 @@ class DbusAggBatService(object):
 
             # initially, no SmartShunt has been found yet
             included_smartshunts = [False] * NR_SMARTSHUNTS
+
+        for vedirect_smartshunt_port in settings.USE_VEDIRECT_SMARTSHUNT_PORTS:
+            self._vedirect_smartshunt_list.append(VeDirectShuntMonitor(vedirect_smartshunt_port))
 
         productName = ""
 
@@ -792,6 +798,8 @@ class DbusAggBatService(object):
         InstalledCapacity = 0
         ConsumedAmphours = 0
         TimeToGo = 0
+        VeDirectShuntConsumedAh: Optional[float] = None
+        VeDirectShuntSoc: Optional[float] = None
 
         # Temperature
         Temperature = 0
@@ -1125,6 +1133,23 @@ class DbusAggBatService(object):
                     else:
                         Current_SHUNTS -= shunt_current
 
+                for vedirect_shunt in self._vedirect_smartshunt_list:
+                    shunt_data = vedirect_shunt.update()
+                    if shunt_data is None:
+                        # Let the default logic in "except" block below process this case.
+                        raise LookupError(
+                            "SmartShunt data is not available yet (which is normal during restart), or the last successfully retrieved data is too old"
+                        )
+
+                    if VeDirectShuntConsumedAh is None:
+                        VeDirectShuntConsumedAh = 0
+                    VeDirectShuntConsumedAh += shunt_data.consumed_ah
+
+                    Current_SHUNTS += shunt_data.current_amps
+
+                    # Aggregating SOC from multiple shunts is not implemented, for simplicity.
+                    VeDirectShuntSoc = shunt_data.soc_percent
+
             except Exception as err:
                 (
                     exception_type,
@@ -1135,7 +1160,8 @@ class DbusAggBatService(object):
                 line = exception_traceback.tb_lineno
                 logging.debug(f"Exception occurred: {repr(exception_object)} of type {exception_type} in {file} line #{line}")
 
-                logging.error("Error during SmartShunt polling: %s" % (err))
+                log_level = logging.WARNING if type(err) is LookupError else logging.ERROR
+                logging.log(log_level, "Error during SmartShunt polling: %s" % (err))
                 if settings.IGNORE_SMARTSHUNT_ABSENCE:
                     success = False
                     pass
@@ -1354,6 +1380,12 @@ class DbusAggBatService(object):
             if TimeToGo is not None:
                 # weighted sum
                 TimeToGo = TimeToGo / InstalledCapacity
+
+        if VeDirectShuntConsumedAh is not None:
+            ConsumedAmphours = VeDirectShuntConsumedAh
+
+        if VeDirectShuntSoc is not None:
+            Soc = VeDirectShuntSoc
 
         #######################
         # Send values to DBus #
