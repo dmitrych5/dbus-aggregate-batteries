@@ -22,6 +22,7 @@ class VeKey(Enum):
     CONSUMED_MAH = "CE"
     CURRENT_MA = "I"
     SOC_PERMILLE = "SOC"
+    STARTER_BATTERY_VOLTAGE_MV = "VS"
 
 
 @dataclass
@@ -29,6 +30,7 @@ class VeDirectShuntData:
     consumed_ah: float
     current_amps: float
     soc_percent: float
+    starter_battery_voltage_volts: float
     read_timestamp: float
 
 
@@ -133,9 +135,16 @@ class VeDirectShuntMonitor:
             consumed_ah = self._parse_int(frame, VeKey.CONSUMED_MAH, 1000.0)
             current_amps = self._parse_int(frame, VeKey.CURRENT_MA, 1000.0)
             soc_percent = self._parse_int(frame, VeKey.SOC_PERMILLE, 10.0)
+            starter_battery_voltage_volts = self._parse_int(frame, VeKey.STARTER_BATTERY_VOLTAGE_MV, 1000.0)
 
             if consumed_ah is not None and current_amps is not None and soc_percent is not None:
-                self.data = VeDirectShuntData(consumed_ah=consumed_ah, current_amps=current_amps, soc_percent=soc_percent, read_timestamp=time.monotonic())
+                self.data = VeDirectShuntData(
+                    consumed_ah=consumed_ah,
+                    current_amps=current_amps,
+                    soc_percent=soc_percent,
+                    starter_battery_voltage_volts=starter_battery_voltage_volts,
+                    read_timestamp=time.monotonic(),
+                )
 
         # If there's no update or update failed this time, return previous data, but only if it's recent enough.
         return None if self.data is None or self.data.read_timestamp < time.monotonic() - DATA_EXPIRATION_SECONDS else self.data

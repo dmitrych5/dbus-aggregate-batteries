@@ -83,6 +83,8 @@ class DbusAggBatService(object):
         self._settings = None
         self._searchTrials = 1
         self._readTrials = 1
+        self._shuntReadTrials = 1
+        self._auxVoltageDeviationTooHigh = False
         self._MaxChargeVoltage_old = 0
         self._MaxChargeCurrent_old = 0
         self._MaxDischargeCurrent_old = 0
@@ -204,6 +206,26 @@ class DbusAggBatService(object):
         self._dbusservice.add_path("/System/MinCellTemperature", None, writeable=True)
         self._dbusservice.add_path("/System/MaxTemperatureCellId", None, writeable=True)
         self._dbusservice.add_path("/System/MaxCellTemperature", None, writeable=True)
+
+        # Paths for PTC chain voltage diagnostics
+        self._dbusservice.add_path(
+            "/Dc/1/Voltage",
+            None,
+            writeable=True,
+            gettextcallback=lambda a, x: "{:.2f}V".format(x),
+        )
+        self._dbusservice.add_path(
+            "/Dc/0/MidVoltageDeviation",
+            None,
+            writeable=True,
+            gettextcallback=lambda a, x: "{:.2f}%".format(x),
+        )
+        self._dbusservice.add_path(
+            "/History/MinimumStarterVoltage",
+            None,
+            writeable=True,
+            gettextcallback=lambda a, x: "{:.2f}V".format(x),
+        )
 
         # Create extras paths
         self._dbusservice.add_path(
@@ -803,6 +825,8 @@ class DbusAggBatService(object):
 
         # Temperature
         Temperature = 0
+        PtcVoltage = None
+        PtcVoltageDeviationPercents = None
         # dictionary {'ID' : MaxCellTemperature, ... } for all physical batteries
         MaxCellTemp_dict = {}
         # dictionary {'ID' : MinCellTemperature, ... } for all physical batteries
@@ -1021,7 +1045,10 @@ class DbusAggBatService(object):
             logging.error("Occured during step %s, Battery %s." % (step, i))
             logging.error("Read trial nr. %d" % self._readTrials)
             self._readTrials += 1
-            if self._readTrials > settings.READ_TRIALS:
+            # Restart after the retry limit is reached, but only if the system is not in a "tripped" state due to potential overheating, since
+            # read errors during overheating add even more reasons to stay in the tripped state until the issue is investigated manually.
+            # A restart would be dangerous because it would reset from the tripped state to normal.
+            if self._readTrials > settings.READ_TRIALS and not self._auxVoltageDeviationTooHigh:
                 logging.error("DBus read failed. Exiting...")
                 tt.sleep(settings.TIME_BEFORE_RESTART)
                 sys.exit(1)
@@ -1146,9 +1173,13 @@ class DbusAggBatService(object):
                     VeDirectShuntConsumedAh += shunt_data.consumed_ah
 
                     Current_SHUNTS += shunt_data.current_amps
+                    PtcVoltage = shunt_data.starter_battery_voltage_volts
 
                     # Aggregating SOC from multiple shunts is not implemented, for simplicity.
                     VeDirectShuntSoc = shunt_data.soc_percent
+
+                    # Reset the number of read trials on success
+                    self._shuntReadTrials = 1
 
             except Exception as err:
                 (
@@ -1162,14 +1193,21 @@ class DbusAggBatService(object):
 
                 log_level = logging.WARNING if type(err) is LookupError else logging.ERROR
                 logging.log(log_level, "Error during SmartShunt polling: %s" % (err))
-                if settings.IGNORE_SMARTSHUNT_ABSENCE:
+                if settings.SMARTSHUNT_ABSENCE_BEHAVIOR == "ignore":
                     success = False
-                    pass
                 else:
-                    self._readTrials += 1
-                    if self._readTrials > settings.READ_TRIALS:
-                        tt.sleep(settings.TIME_BEFORE_RESTART)
-                        sys.exit(1)
+                    self._shuntReadTrials += 1
+                    if self._shuntReadTrials > settings.READ_TRIALS:
+                        if settings.SMARTSHUNT_ABSENCE_BEHAVIOR == "setzerocurrentlimits":
+                            MaxChargeCurrent = 0
+                            MaxDischargeCurrent = 0
+                            # Set NrOfModulesBlockingCharge/Discharge so that CCL/DCL are also set to 0 when settings.OWN_CHARGE_PARAMETERS == True
+                            NrOfModulesBlockingCharge += 1
+                            NrOfModulesBlockingDischarge += 1
+                        else:  # "restart"
+                            tt.sleep(settings.TIME_BEFORE_RESTART)
+                            logging.log(logging.ERROR, "SmartShunt is absent. Restarting.")
+                            sys.exit(1)
                     else:
                         # next call allowed
                         return True
@@ -1387,6 +1425,33 @@ class DbusAggBatService(object):
         if VeDirectShuntSoc is not None:
             Soc = VeDirectShuntSoc
 
+        if settings.EXPECTED_AUX_VOLTAGES and MinCellTemp and MaxCellTemp:
+            MinExpectedPtcVoltage = self._fn._interpolate(
+                settings.EXPECTED_AUX_VOLTAGE_TEMPERATURES,
+                settings.EXPECTED_AUX_VOLTAGES,
+                MinCellTemp,
+            )
+            MaxExpectedPtcVoltage = self._fn._interpolate(
+                settings.EXPECTED_AUX_VOLTAGE_TEMPERATURES,
+                settings.EXPECTED_AUX_VOLTAGES,
+                MaxCellTemp,
+            )
+            # Take the maximum of deviations from all temperature sensors, since if one battery is getting much hotter than the others it could be a sign of an
+            # issue with that battery.
+            PtcVoltageDeviationPercents = (
+                max(abs((PtcVoltage - MinExpectedPtcVoltage) / MinExpectedPtcVoltage), abs((PtcVoltage - MaxExpectedPtcVoltage) / MaxExpectedPtcVoltage)) * 100
+            )
+            if PtcVoltageDeviationPercents > settings.MAX_AUX_VOLTAGE_DEVIATION_PERCENTS or self._auxVoltageDeviationTooHigh:
+                MaxChargeCurrent = 0
+                MaxDischargeCurrent = 0
+                if not self._auxVoltageDeviationTooHigh:
+                    # Stay in the tripped state until restart, so that the issue can be investigated manually.
+                    self._auxVoltageDeviationTooHigh = True
+                    logging.error(
+                        f"Setting CCL/DCL to 0 because Aux voltage deviation is too high: {PtcVoltageDeviationPercents:.1f}%, Aux voltage: {PtcVoltage}, "
+                        f"Min cell temperature: {MinCellTemp}, Max cell temperature: {MaxCellTemp}"
+                    )
+
         #######################
         # Send values to DBus #
         #######################
@@ -1414,6 +1479,14 @@ class DbusAggBatService(object):
             bus["/System/MaxTemperatureCellId"] = MaxTempCellId
             bus["/System/MinCellTemperature"] = MinCellTemp
             bus["/System/MinTemperatureCellId"] = MinTempCellId
+
+            # PTC voltage is sent multiplied by 10 for higher resolution logging in VRM
+            bus["/Dc/1/Voltage"] = None if PtcVoltage is None else PtcVoltage * 10
+            # PTC voltage deviation
+            bus["/Dc/0/MidVoltageDeviation"] = PtcVoltageDeviationPercents
+            # The line below is an intentional misuse of /History/MinimumStarterVoltage, since there's no other easy way to log temperature with higher
+            # resolution
+            bus["/History/MinimumStarterVoltage"] = Temperature
 
             # send cell voltages
             bus["/System/MaxCellVoltage"] = MaxCellVoltage
